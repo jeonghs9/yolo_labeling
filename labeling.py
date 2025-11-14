@@ -1,0 +1,498 @@
+import sys
+import os
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+    QPushButton, QLabel, QListWidget, QFileDialog
+)
+from PyQt6.QtGui import QPixmap, QPainter, QPen
+from PyQt6.QtCore import Qt, QRectF
+
+
+class ImageLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.image = None          # QPixmap
+        self.img_w = 0
+        self.img_h = 0
+
+        # boxes: list of (cls_id, x1, y1, x2, y2) in pixel coords
+        self.boxes = []
+        self.drawing = False
+        self.start_pos = None
+        self.current_box = None    # (x1, y1, x2, y2)
+
+        # scaling / zoom
+        self.base_scale = 1.0
+        self.zoom_factor = 1.0
+        self.scale = 1.0
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+
+        # panning (Ctrl + 드래그)
+        self.panning = False
+        self.pan_start = None      # QPointF
+        self.pan_dx = 0.0
+        self.pan_dy = 0.0
+
+        # current class id (0~9)
+        self.current_class = 0
+
+        # 클래스별 색상 매핑
+        self.class_colors = {
+            0: Qt.GlobalColor.red,
+            1: Qt.GlobalColor.green,
+            2: Qt.GlobalColor.blue,
+            3: Qt.GlobalColor.yellow,
+            4: Qt.GlobalColor.cyan,
+            5: Qt.GlobalColor.magenta,
+            6: Qt.GlobalColor.white,
+            7: Qt.GlobalColor.gray,
+            8: Qt.GlobalColor.darkRed,
+            9: Qt.GlobalColor.darkGreen,
+        }
+
+    def set_image(self, pixmap: QPixmap | None):
+        self.image = pixmap
+        if pixmap is not None:
+            self.img_w = pixmap.width()
+            self.img_h = pixmap.height()
+        else:
+            self.img_w = self.img_h = 0
+        # 이미지 바뀌면 줌/패닝 리셋
+        self.zoom_factor = 1.0
+        self.pan_dx = 0.0
+        self.pan_dy = 0.0
+        self.update()
+
+    def set_boxes(self, boxes):
+        """
+        boxes: list of (cls_id, x1, y1, x2, y2) in pixel coords
+        """
+        self.boxes = boxes
+        self.update()
+
+    def get_boxes(self):
+        return self.boxes
+
+    def set_current_class(self, cls_id: int):
+        self.current_class = int(cls_id)
+
+    def mousePressEvent(self, event):
+        # 클릭하면 메인 윈도우가 키보드 포커스를 가지도록
+        if self.window():
+            self.window().setFocus()
+
+        if self.image is None:
+            return
+
+        mods = event.modifiers()
+
+        # Ctrl + 왼쪽 드래그: 패닝 시작
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and (mods & Qt.KeyboardModifier.ControlModifier)
+        ):
+            self.panning = True
+            self.pan_start = event.position()
+            return
+
+        # 좌클릭: 박스 그리기 시작
+        if event.button() == Qt.MouseButton.LeftButton:
+            x, y = self._map_to_image(event.position())
+            if x is None:
+                return
+            self.drawing = True
+            self.start_pos = (x, y)
+            self.current_box = None
+
+        # 우클릭: 클릭 위치에 있는 박스 삭제
+        elif event.button() == Qt.MouseButton.RightButton:
+            x, y = self._map_to_image(event.position())
+            if x is None:
+                return
+            # 나중에 추가된 박스부터 역순으로 검사해서 가장 위에 있는 것 삭제
+            removed = False
+            for i in range(len(self.boxes) - 1, -1, -1):
+                cls_id, x1, y1, x2, y2 = self.boxes[i]
+                if (x1 <= x <= x2) and (y1 <= y <= y2):
+                    del self.boxes[i]
+                    removed = True
+                    break
+            if removed:
+                self.update()
+
+    def mouseMoveEvent(self, event):
+        # 패닝 중이면 이미지 이동
+        if self.panning and self.pan_start is not None:
+            delta = event.position() - self.pan_start
+            self.pan_start = event.position()
+            self.pan_dx += delta.x()
+            self.pan_dy += delta.y()
+            self.update()
+            return
+
+        # 박스 드래그 중
+        if self.drawing and self.start_pos is not None:
+            x, y = self._map_to_image(event.position())
+            if x is None:
+                return
+            x1, y1 = self.start_pos
+            self.current_box = (x1, y1, x, y)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        # 패닝 종료
+        if event.button() == Qt.MouseButton.LeftButton and self.panning:
+            self.panning = False
+            self.pan_start = None
+            return
+
+        # 박스 그리기 종료
+        if event.button() == Qt.MouseButton.LeftButton and self.drawing:
+            self.drawing = False
+            if self.current_box is not None:
+                x1, y1, x2, y2 = self.current_box
+                x_min, x_max = sorted([x1, x2])
+                y_min, y_max = sorted([y1, y2])
+                # 현재 선택된 클래스 id로 박스 추가
+                self.boxes.append((self.current_class, x_min, y_min, x_max, y_max))
+            self.current_box = None
+            self.update()
+
+    def wheelEvent(self, event):
+        # 이미지가 없으면 줌 동작 안 함
+        if self.image is None or self.img_w == 0 or self.img_h == 0:
+            return
+
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.zoom_factor *= 1.1
+        elif delta < 0:
+            self.zoom_factor /= 1.1
+
+        # 줌 한계 설정
+        self.zoom_factor = max(0.2, min(self.zoom_factor, 10.0))
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+
+        if self.image is not None:
+            label_w = self.width()
+            label_h = self.height()
+
+            if self.img_w == 0 or self.img_h == 0:
+                return
+
+            # 기본 스케일 (전체 이미지가 보이도록)
+            scale_x = label_w / self.img_w
+            scale_y = label_h / self.img_h
+            self.base_scale = min(scale_x, scale_y)
+
+            # 줌 반영한 최종 스케일
+            self.scale = self.base_scale * self.zoom_factor
+
+            draw_w = self.img_w * self.scale
+            draw_h = self.img_h * self.scale
+
+            # 기본은 중앙 정렬, 여기에 pan_dx/pan_dy 더함
+            base_off_x = (label_w - draw_w) / 2
+            base_off_y = (label_h - draw_h) / 2
+
+            self.offset_x = base_off_x + self.pan_dx
+            self.offset_y = base_off_y + self.pan_dy
+
+            target_rect = QRectF(
+                self.offset_x, self.offset_y,
+                draw_w, draw_h
+            )
+            source_rect = QRectF(self.image.rect())
+            painter.drawPixmap(target_rect, self.image, source_rect)
+
+            # 박스들 그리기
+            for cls_id, x1, y1, x2, y2 in self.boxes:
+                color = self.class_colors.get(cls_id, Qt.GlobalColor.red)
+                pen = QPen(color)
+                pen.setWidth(2)
+                painter.setPen(pen)
+
+                rx1 = self.offset_x + x1 * self.scale
+                ry1 = self.offset_y + y1 * self.scale
+                rx2 = self.offset_x + x2 * self.scale
+                ry2 = self.offset_y + y2 * self.scale
+                painter.drawRect(QRectF(rx1, ry1, rx2 - rx1, ry2 - ry1))
+
+            # 드래그 중인 박스 (현재 클래스 색으로)
+            if self.current_box is not None:
+                x1, y1, x2, y2 = self.current_box
+                color = self.class_colors.get(self.current_class, Qt.GlobalColor.white)
+                pen = QPen(color)
+                pen.setWidth(2)
+                painter.setPen(pen)
+
+                rx1 = self.offset_x + x1 * self.scale
+                ry1 = self.offset_y + y1 * self.scale
+                rx2 = self.offset_x + x2 * self.scale
+                ry2 = self.offset_y + y2 * self.scale
+                painter.drawRect(QRectF(rx1, ry1, rx2 - rx1, ry2 - ry1))
+
+    def _map_to_image(self, pos):
+        """
+        라벨 좌표(QPointF) → 원본 이미지 좌표(float)
+        """
+        if self.image is None or self.scale == 0:
+            return None, None
+        x = (pos.x() - self.offset_x) / self.scale
+        y = (pos.y() - self.offset_y) / self.scale
+        if x < 0 or y < 0 or x > self.img_w or y > self.img_h:
+            return None, None
+        return x, y
+
+
+def yolo_to_boxes(label_path, img_w, img_h):
+    """
+    YOLO 포맷 txt → [(cls_id, x1, y1, x2, y2), ...]
+    """
+    boxes = []
+    if not os.path.exists(label_path):
+        return boxes
+    with open(label_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 5:
+                continue
+            cls_id, xc, yc, w, h = parts
+            cls_id = int(cls_id)
+            xc = float(xc) * img_w
+            yc = float(yc) * img_h
+            w = float(w) * img_w
+            h = float(h) * img_h
+            x1 = xc - w / 2
+            y1 = yc - h / 2
+            x2 = xc + w / 2
+            y2 = yc + h / 2
+            boxes.append((cls_id, x1, y1, x2, y2))
+    return boxes
+
+
+def boxes_to_yolo(boxes, img_w, img_h):
+    """
+    [(cls_id, x1, y1, x2, y2), ...] → YOLO 포맷 문자열
+    """
+    lines = []
+    for cls_id, x1, y1, x2, y2 in boxes:
+        w = (x2 - x1) / img_w
+        h = (y2 - y1) / img_h
+        xc = (x1 + x2) / 2 / img_w
+        yc = (y1 + y2) / 2 / img_h
+        lines.append(f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
+    return "\n".join(lines)
+
+
+class LabelingTool(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("YOLO Labeling Tool (PyQt6)")
+
+        self.image_dir = ""
+        self.label_dir = ""
+        self.image_files: list[str] = []
+        self.current_index = -1
+
+        # 현재 클래스 id (0~9)
+        self.current_class = 0
+
+        # 이미지별 임시 박스 캐시: {img_name: boxes}
+        self.label_cache = {}
+
+        self.init_ui()
+
+    def init_ui(self):
+        main_widget = QWidget()
+        main_layout = QHBoxLayout(main_widget)
+
+        # 메인 윈도우가 키보드 포커스를 받을 수 있게 설정
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        # 왼쪽: 폴더 버튼 + 현재 클래스 표시 + 이미지 리스트 + 저장 버튼
+        left_layout = QVBoxLayout()
+        self.list_widget = QListWidget()
+        self.list_widget.currentRowChanged.connect(self.on_list_changed)
+
+        btn_img_dir = QPushButton("이미지 폴더 선택")
+        btn_img_dir.clicked.connect(self.select_image_dir)
+        btn_lbl_dir = QPushButton("라벨 폴더 선택")
+        btn_lbl_dir.clicked.connect(self.select_label_dir)
+
+        self.class_label = QLabel(f"현재 클래스: {self.current_class}")
+
+        self.save_button = QPushButton("현재 이미지 저장")
+        self.save_button.clicked.connect(self.save_current_image)
+
+        left_layout.addWidget(btn_img_dir)
+        left_layout.addWidget(btn_lbl_dir)
+        left_layout.addWidget(self.class_label)
+        left_layout.addWidget(self.list_widget)
+        left_layout.addWidget(self.save_button)
+
+        # 중앙: 이미지 라벨 위젯
+        self.image_label = ImageLabel()
+        self.image_label.setStyleSheet("background-color: black;")
+        self.image_label.set_current_class(self.current_class)
+
+        main_layout.addLayout(left_layout, 1)
+        main_layout.addWidget(self.image_label, 4)
+
+        self.setCentralWidget(main_widget)
+        self.resize(1400, 800)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+
+        # 다음/이전 이미지
+        if key == Qt.Key.Key_Right:
+            self.next_image()
+        elif key == Qt.Key.Key_Left:
+            self.prev_image()
+        # 숫자 키로 클래스 선택 (0~9)
+        elif Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+            cls_id = key - Qt.Key.Key_0
+            self.current_class = cls_id
+            self.image_label.set_current_class(cls_id)
+            self.class_label.setText(f"현재 클래스: {cls_id}")
+        else:
+            super().keyPressEvent(event)
+
+    def select_image_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "이미지 폴더 선택")
+        if d:
+            self.image_dir = d
+            self.load_image_list()
+
+    def select_label_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "라벨 폴더 선택")
+        if d:
+            self.label_dir = d
+            # 라벨 폴더 선택 후, 현재 이미지에 대해 라벨 바로 반영
+            if self.image_files and self.current_index != -1:
+                self.load_current_image()
+
+    def load_image_list(self):
+        if not self.image_dir:
+            return
+        exts = {".jpg", ".jpeg", ".png", ".bmp"}
+        self.image_files = [
+            f for f in sorted(os.listdir(self.image_dir))
+            if os.path.splitext(f)[1].lower() in exts
+        ]
+        self.list_widget.clear()
+        self.list_widget.addItems(self.image_files)
+
+        if self.image_files:
+            self.current_index = 0
+            self.list_widget.setCurrentRow(0)
+            self.load_current_image()
+
+    def on_list_changed(self, row: int):
+        if row < 0 or row >= len(self.image_files):
+            return
+        # 현재 이미지 박스를 캐시에 임시 저장
+        self.update_cache_for_current_image()
+        self.current_index = row
+        self.load_current_image()
+
+    def current_image_path(self):
+        if self.current_index < 0 or self.current_index >= len(self.image_files):
+            return None
+        return os.path.join(self.image_dir, self.image_files[self.current_index])
+
+    def current_label_path(self):
+        if not self.label_dir or self.current_index < 0:
+            return None
+        img_name = self.image_files[self.current_index]
+        base, _ = os.path.splitext(img_name)
+        return os.path.join(self.label_dir, base + ".txt")
+
+    def update_cache_for_current_image(self):
+        """현재 화면에 그려진 박스를 캐시에 저장 (파일에는 안 씀)"""
+        if self.current_index < 0 or not self.image_files:
+            return
+        img_name = self.image_files[self.current_index]
+        boxes = self.image_label.get_boxes()
+        # 얕은 복사해서 보관
+        self.label_cache[img_name] = list(boxes)
+
+    def load_current_image(self):
+        img_path = self.current_image_path()
+        if not img_path:
+            return
+        pixmap = QPixmap(img_path)
+        self.image_label.set_image(pixmap)
+
+        img_name = self.image_files[self.current_index]
+        boxes = []
+
+        # 1순위: 캐시에 이미 있으면 캐시 사용
+        if img_name in self.label_cache:
+            boxes = self.label_cache[img_name]
+        # 2순위: 캐시에 없고, 라벨 txt가 있으면 읽어서 캐시에 넣기
+        else:
+            lbl_path = self.current_label_path()
+            if lbl_path:
+                boxes = yolo_to_boxes(lbl_path, self.image_label.img_w, self.image_label.img_h)
+            self.label_cache[img_name] = list(boxes)
+
+        self.image_label.set_boxes(list(boxes))
+
+    def save_current_image(self):
+        """현재 이미지의 라벨을 txt 파일로 저장 (Save 버튼 클릭 시에만 호출)"""
+        if self.current_index < 0 or not self.label_dir:
+            return
+
+        # 화면에 있는 박스를 캐시에 반영
+        self.update_cache_for_current_image()
+
+        img_name = self.image_files[self.current_index]
+        boxes = self.label_cache.get(img_name, [])
+        img_w = self.image_label.img_w
+        img_h = self.image_label.img_h
+        if img_w == 0 or img_h == 0:
+            return
+
+        lbl_path = self.current_label_path()
+        if not lbl_path:
+            return
+
+        yolo_txt = boxes_to_yolo(boxes, img_w, img_h)
+        os.makedirs(self.label_dir, exist_ok=True)
+        with open(lbl_path, "w", encoding="utf-8") as f:
+            f.write(yolo_txt)
+
+    def next_image(self):
+        if not self.image_files:
+            return
+        # 파일 저장은 안 하고, 캐시만 업데이트
+        self.update_cache_for_current_image()
+        if self.current_index < len(self.image_files) - 1:
+            self.current_index += 1
+            self.list_widget.setCurrentRow(self.current_index)
+
+    def prev_image(self):
+        if not self.image_files:
+            return
+        self.update_cache_for_current_image()
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.list_widget.setCurrentRow(self.current_index)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = LabelingTool()
+    win.show()
+    sys.exit(app.exec())

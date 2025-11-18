@@ -2,8 +2,9 @@ import sys
 import os
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QPushButton, QLabel, QListWidget, QFileDialog
+    QPushButton, QLabel, QListWidget, QFileDialog, QMessageBox
 )
+
 from PyQt6.QtGui import QPixmap, QPainter, QPen
 from PyQt6.QtCore import Qt, QRectF
 
@@ -40,16 +41,16 @@ class ImageLabel(QLabel):
 
         # 클래스별 색상 매핑
         self.class_colors = {
-            0: Qt.GlobalColor.red,
+            0: Qt.GlobalColor.yellow,
             1: Qt.GlobalColor.green,
-            2: Qt.GlobalColor.blue,
-            3: Qt.GlobalColor.yellow,
-            4: Qt.GlobalColor.cyan,
-            5: Qt.GlobalColor.magenta,
-            6: Qt.GlobalColor.white,
-            7: Qt.GlobalColor.gray,
-            8: Qt.GlobalColor.darkRed,
-            9: Qt.GlobalColor.darkGreen,
+            2: Qt.GlobalColor.red,
+            3: Qt.GlobalColor.blue,
+            # 4: Qt.GlobalColor.cyan,
+            # 5: Qt.GlobalColor.magenta,
+            # 6: Qt.GlobalColor.white,
+            # 7: Qt.GlobalColor.gray,
+            # 8: Qt.GlobalColor.darkRed,
+            # 9: Qt.GlobalColor.darkGreen,
         }
 
     def set_image(self, pixmap: QPixmap | None):
@@ -310,6 +311,9 @@ class LabelingTool(QMainWindow):
         # 이미지별 임시 박스 캐시: {img_name: boxes}
         self.label_cache = {}
 
+        # 라벨을 수정/확인한 이미지 집합(체크 표시용)
+        self.modified_images = set()
+
         self.init_ui()
 
     def init_ui(self):
@@ -390,8 +394,19 @@ class LabelingTool(QMainWindow):
             f for f in sorted(os.listdir(self.image_dir))
             if os.path.splitext(f)[1].lower() in exts
         ]
+
+        # 새 이미지 폴더 선택하면 캐시/체크 상태 초기화
+        self.label_cache.clear()
+        self.modified_images.clear()
+
         self.list_widget.clear()
         self.list_widget.addItems(self.image_files)
+
+        # 리스트 아이템을 체크 가능하게 만들기
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
 
         if self.image_files:
             self.current_index = 0
@@ -401,9 +416,15 @@ class LabelingTool(QMainWindow):
     def on_list_changed(self, row: int):
         if row < 0 or row >= len(self.image_files):
             return
-        # 현재 이미지 박스를 캐시에 임시 저장
-        self.update_cache_for_current_image()
+
+        # 1) 현재 보이던 이미지(이전 인덱스)에 대한 캐시 저장
+        if 0 <= self.current_index < len(self.image_files):
+            self.update_cache_for_current_image()
+
+        # 2) 인덱스 갱신
         self.current_index = row
+
+        # 3) 새 이미지 로드
         self.load_current_image()
 
     def current_image_path(self):
@@ -422,10 +443,19 @@ class LabelingTool(QMainWindow):
         """현재 화면에 그려진 박스를 캐시에 저장 (파일에는 안 씀)"""
         if self.current_index < 0 or not self.image_files:
             return
+
         img_name = self.image_files[self.current_index]
         boxes = self.image_label.get_boxes()
+
         # 얕은 복사해서 보관
         self.label_cache[img_name] = list(boxes)
+
+        # 수정된/확인된 이미지로 표시
+        self.modified_images.add(img_name)
+        item = self.list_widget.item(self.current_index)
+        if item is not None:
+            item.setCheckState(Qt.CheckState.Checked)
+
 
     def load_current_image(self):
         img_path = self.current_image_path()
@@ -437,59 +467,86 @@ class LabelingTool(QMainWindow):
         img_name = self.image_files[self.current_index]
         boxes = []
 
-        # 1순위: 캐시에 이미 있으면 캐시 사용
+        # 이미 수정한 이미지라면 체크 표시 유지
+        item = self.list_widget.item(self.current_index)
+        if item is not None:
+            if img_name in self.modified_images:
+                item.setCheckState(Qt.CheckState.Checked)
+            else:
+                # 필요하다면 수정 안 된 건 Unchecked로
+                # item.setCheckState(Qt.CheckState.Unchecked)
+                pass
+
+        # 1순위: 캐시
         if img_name in self.label_cache:
             boxes = self.label_cache[img_name]
-        # 2순위: 캐시에 없고, 라벨 txt가 있으면 읽어서 캐시에 넣기
         else:
             lbl_path = self.current_label_path()
-            if lbl_path:
+            if lbl_path and os.path.exists(lbl_path):
                 boxes = yolo_to_boxes(lbl_path, self.image_label.img_w, self.image_label.img_h)
-            self.label_cache[img_name] = list(boxes)
 
-        self.image_label.set_boxes(list(boxes))
+        self.image_label.set_boxes(boxes)
+
 
     def save_current_image(self):
-        """현재 이미지의 라벨을 txt 파일로 저장 (Save 버튼 클릭 시에만 호출)"""
-        if self.current_index < 0 or not self.label_dir:
+        """
+        Save 버튼 클릭 시:
+        - 현재 이미지 포함, 지금까지 수정/체크된 모든 이미지의 라벨을
+          txt 파일로 덮어쓰기 저장
+        - 몇 개 저장됐는지 팝업으로 알려줌
+        """
+        if not self.label_dir:
             return
 
-        # 화면에 있는 박스를 캐시에 반영
+        # 현재 화면에 보이는 것도 캐시에 반영
         self.update_cache_for_current_image()
 
-        img_name = self.image_files[self.current_index]
-        boxes = self.label_cache.get(img_name, [])
-        img_w = self.image_label.img_w
-        img_h = self.image_label.img_h
-        if img_w == 0 or img_h == 0:
+        if not self.modified_images:
+            QMessageBox.information(self, "저장", "수정된 이미지가 없습니다.")
             return
 
-        lbl_path = self.current_label_path()
-        if not lbl_path:
-            return
-
-        yolo_txt = boxes_to_yolo(boxes, img_w, img_h)
         os.makedirs(self.label_dir, exist_ok=True)
-        with open(lbl_path, "w", encoding="utf-8") as f:
-            f.write(yolo_txt)
+
+        saved = 0
+        for img_name in sorted(self.modified_images):
+            boxes = self.label_cache.get(img_name, [])
+
+            # 각 이미지의 원본 크기 필요 → 직접 로드
+            img_path = os.path.join(self.image_dir, img_name)
+            pixmap = QPixmap(img_path)
+            if pixmap.isNull():
+                continue
+            img_w = pixmap.width()
+            img_h = pixmap.height()
+            if img_w == 0 or img_h == 0:
+                continue
+
+            base, _ = os.path.splitext(img_name)
+            lbl_path = os.path.join(self.label_dir, base + ".txt")
+
+            yolo_txt = boxes_to_yolo(boxes, img_w, img_h)
+            with open(lbl_path, "w", encoding="utf-8") as f:
+                f.write(yolo_txt)
+            saved += 1
+
+        QMessageBox.information(
+            self,
+            "저장 완료",
+            f"체크된 이미지 {len(self.modified_images)}개 중 {saved}개를 저장했습니다."
+        )
 
     def next_image(self):
         if not self.image_files:
             return
-        # 파일 저장은 안 하고, 캐시만 업데이트
-        self.update_cache_for_current_image()
         if self.current_index < len(self.image_files) - 1:
-            self.current_index += 1
-            self.list_widget.setCurrentRow(self.current_index)
+            # 인덱스는 여기서 건드리지 않고, 선택만 변경
+            self.list_widget.setCurrentRow(self.current_index + 1)
 
     def prev_image(self):
         if not self.image_files:
             return
-        self.update_cache_for_current_image()
         if self.current_index > 0:
-            self.current_index -= 1
-            self.list_widget.setCurrentRow(self.current_index)
-
+            self.list_widget.setCurrentRow(self.current_index - 1)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

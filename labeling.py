@@ -335,6 +335,9 @@ class LabelingTool(QMainWindow):
 
         self.class_label = QLabel(f"현재 클래스: {self.current_class}")
 
+        self.clear_button = QPushButton("현재 이미지 라벨 삭제")
+        self.clear_button.clicked.connect(self.clear_current_labels)
+
         self.save_button = QPushButton("현재 이미지 저장")
         self.save_button.clicked.connect(self.save_current_image)
 
@@ -342,7 +345,9 @@ class LabelingTool(QMainWindow):
         left_layout.addWidget(btn_lbl_dir)
         left_layout.addWidget(self.class_label)
         left_layout.addWidget(self.list_widget)
+        left_layout.addWidget(self.clear_button)
         left_layout.addWidget(self.save_button)
+        
 
         # 중앙: 이미지 라벨 위젯
         self.image_label = ImageLabel()
@@ -455,6 +460,33 @@ class LabelingTool(QMainWindow):
         item = self.list_widget.item(self.current_index)
         if item is not None:
             item.setCheckState(Qt.CheckState.Checked)
+    
+    def clear_current_labels(self):
+        """
+        현재 이미지의 바운딩박스를 모두 제거하는 버튼 동작
+        - 화면에서 박스 삭제
+        - 캐시에도 빈 리스트로 반영
+        - 수정된 이미지로 체크 표시 유지
+        """
+        if self.current_index < 0 or not self.image_files:
+            return
+
+        # 선택 확인 팝업 (원하면 빼도 됨)
+        reply = QMessageBox.question(
+            self,
+            "라벨 삭제 확인",
+            "현재 이미지의 모든 라벨을 삭제하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # 1) 화면에서 박스 모두 제거
+        self.image_label.set_boxes([])
+
+        # 2) 캐시/체크 상태 업데이트
+        self.update_cache_for_current_image()
 
 
     def load_current_image(self):
@@ -547,6 +579,20 @@ class LabelingTool(QMainWindow):
             return
         if self.current_index > 0:
             self.list_widget.setCurrentRow(self.current_index - 1)
+
+    def closeEvent(self, event):
+        reply = QMessageBox.question(
+            self,
+            "프로그램 종료",
+            "정말 종료하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            event.accept()   # 진짜 닫기
+        else:
+            event.ignore()   # 닫기 취소
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

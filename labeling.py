@@ -387,7 +387,14 @@ class LabelingTool(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "라벨 폴더 선택")
         if d:
             self.label_dir = d
-            # 라벨 폴더 선택 후, 현재 이미지에 대해 라벨 바로 반영
+
+            # 현재 이미지 캐시 제거
+            if self.image_files and self.current_index != -1:
+                img_name = self.image_files[self.current_index]
+                if img_name in self.label_cache:
+                    del self.label_cache[img_name]
+
+            # 강제로 라벨 포함해 다시 로딩
             if self.image_files and self.current_index != -1:
                 self.load_current_image()
 

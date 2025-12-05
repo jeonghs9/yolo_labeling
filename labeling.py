@@ -39,6 +39,9 @@ class ImageLabel(QLabel):
         # current class id (0~9)
         self.current_class = 0
 
+        # 컨트롤 제트
+        self.undo_stack = []
+
         # 클래스별 색상 매핑
         self.class_colors = {
             0: Qt.GlobalColor.yellow,
@@ -79,40 +82,37 @@ class ImageLabel(QLabel):
     def set_current_class(self, cls_id: int):
         self.current_class = int(cls_id)
 
+    def undo(self):
+        """
+        Ctrl+Z → 마지막 작업(박스 추가)을 되돌리기
+        """
+        if not self.undo_stack:
+            return
+
+        action, box = self.undo_stack.pop()
+
+        if action == "add":
+            # 마지막 생성된 박스를 제거
+            if box in self.boxes:
+                self.boxes.remove(box)
+
+        self.update()
+
+
     def mousePressEvent(self, event):
-        # 클릭하면 메인 윈도우가 키보드 포커스를 가지도록
         if self.window():
             self.window().setFocus()
 
         if self.image is None:
             return
 
-        mods = event.modifiers()
-
-        # Ctrl + 왼쪽 드래그: 패닝 시작
-        if (
-            event.button() == Qt.MouseButton.LeftButton
-            and (mods & Qt.KeyboardModifier.ControlModifier)
-        ):
-            self.panning = True
-            self.pan_start = event.position()
+        # 위치 변환
+        x, y = self._map_to_image(event.position())
+        if x is None:
             return
 
-        # 좌클릭: 박스 그리기 시작
-        if event.button() == Qt.MouseButton.LeftButton:
-            x, y = self._map_to_image(event.position())
-            if x is None:
-                return
-            self.drawing = True
-            self.start_pos = (x, y)
-            self.current_box = None
-
-        # 우클릭: 클릭 위치에 있는 박스 삭제
-        elif event.button() == Qt.MouseButton.RightButton:
-            x, y = self._map_to_image(event.position())
-            if x is None:
-                return
-            # 나중에 추가된 박스부터 역순으로 검사해서 가장 위에 있는 것 삭제
+        # 우클릭은 삭제 그대로 유지
+        if event.button() == Qt.MouseButton.RightButton:
             removed = False
             for i in range(len(self.boxes) - 1, -1, -1):
                 cls_id, x1, y1, x2, y2 = self.boxes[i]
@@ -122,9 +122,38 @@ class ImageLabel(QLabel):
                     break
             if removed:
                 self.update()
+            return
+
+        # 좌클릭 → 두 번 클릭 방식
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 첫 클릭 (시작점)
+            if not self.drawing:
+                self.start_pos = (x, y)
+                self.drawing = True
+                self.current_box = None
+            # 두 번째 클릭 (완료)
+            else:
+                x1, y1 = self.start_pos
+                x2, y2 = x, y
+                x_min, x_max = sorted([x1, x2])
+                y_min, y_max = sorted([y1, y2])
+
+                new_box = (self.current_class, x_min, y_min, x_max, y_max)
+                self.boxes.append(new_box)
+
+                # undo 스택에 추가
+                self.undo_stack.append(("add", new_box))
+
+                # 초기화
+                self.drawing = False
+                self.start_pos = None
+                self.current_box = None
+
+                self.update()
+
 
     def mouseMoveEvent(self, event):
-        # 패닝 중이면 이미지 이동
+        # 드래그 기반 패닝 그대로 유지
         if self.panning and self.pan_start is not None:
             delta = event.position() - self.pan_start
             self.pan_start = event.position()
@@ -133,7 +162,7 @@ class ImageLabel(QLabel):
             self.update()
             return
 
-        # 박스 드래그 중
+        # 첫 클릭 이후 마우스를 움직이면 박스 미리보기
         if self.drawing and self.start_pos is not None:
             x, y = self._map_to_image(event.position())
             if x is None:
@@ -142,35 +171,24 @@ class ImageLabel(QLabel):
             self.current_box = (x1, y1, x, y)
             self.update()
 
+
     def mouseReleaseEvent(self, event):
-        # 패닝 종료
+        # 패닝 종료만 유지
         if event.button() == Qt.MouseButton.LeftButton and self.panning:
             self.panning = False
             self.pan_start = None
-            return
 
-        # 박스 그리기 종료
-        if event.button() == Qt.MouseButton.LeftButton and self.drawing:
-            self.drawing = False
-            if self.current_box is not None:
-                x1, y1, x2, y2 = self.current_box
-                x_min, x_max = sorted([x1, x2])
-                y_min, y_max = sorted([y1, y2])
-                # 현재 선택된 클래스 id로 박스 추가
-                self.boxes.append((self.current_class, x_min, y_min, x_max, y_max))
-            self.current_box = None
-            self.update()
 
-    def wheelEvent(self, event):
-        # 이미지가 없으면 줌 동작 안 함
-        if self.image is None or self.img_w == 0 or self.img_h == 0:
-            return
+        def wheelEvent(self, event):
+            # 이미지가 없으면 줌 동작 안 함
+            if self.image is None or self.img_w == 0 or self.img_h == 0:
+                return
 
-        delta = event.angleDelta().y()
-        if delta > 0:
-            self.zoom_factor *= 1.1
-        elif delta < 0:
-            self.zoom_factor /= 1.1
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self.zoom_factor *= 1.1
+            elif delta < 0:
+                self.zoom_factor /= 1.1
 
         # 줌 한계 설정
         self.zoom_factor = max(0.2, min(self.zoom_factor, 10.0))
@@ -374,6 +392,10 @@ class LabelingTool(QMainWindow):
             self.current_class = cls_id
             self.image_label.set_current_class(cls_id)
             self.class_label.setText(f"현재 클래스: {cls_id}")
+        # Ctrl + Z → Undo
+        elif (event.modifiers() & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_Z:
+            self.image_label.undo()
+
         else:
             super().keyPressEvent(event)
 

@@ -4,58 +4,61 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QListWidget, QFileDialog, QMessageBox
 )
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QPolygonF, QCursor
+from PyQt6.QtCore import Qt, QRectF, QPointF
 
-from PyQt6.QtGui import QPixmap, QPainter, QPen
-from PyQt6.QtCore import Qt, QRectF
 
 
+# ==========================
+#   ImageLabel 위젯
+# ==========================
 class ImageLabel(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMouseTracking(True)
-        self.image = None          # QPixmap
+
+        # 이미지 상태
+        self.image: QPixmap | None = None
         self.img_w = 0
         self.img_h = 0
 
-        # boxes: list of (cls_id, x1, y1, x2, y2) in pixel coords
-        self.boxes = []
-        self.drawing = False
-        self.start_pos = None
-        self.current_box = None    # (x1, y1, x2, y2)
+        # 모드: "bbox" or "seg"
+        self.mode = "bbox"
 
-        # scaling / zoom
-        self.base_scale = 1.0
+        # BBox 데이터: (cls, x1, y1, x2, y2) in pixel
+        self.boxes: list[tuple[int, float, float, float, float]] = []
+        self.box_start: tuple[float, float] | None = None
+        self.box_preview_end: tuple[float, float] | None = None
+
+        # Seg 데이터: (cls, [(x,y), ...]) in pixel
+        self.polygons: list[tuple[int, list[tuple[float, float]]]] = []
+        self.current_polygon: list[tuple[float, float]] = []
+        self.seg_preview_point: tuple[float, float] | None = None
+
+        # 줌/팬
         self.zoom_factor = 1.0
+        self.base_scale = 1.0
         self.scale = 1.0
         self.offset_x = 0.0
         self.offset_y = 0.0
-
-        # panning (Ctrl + 드래그)
-        self.panning = False
-        self.pan_start = None      # QPointF
         self.pan_dx = 0.0
         self.pan_dy = 0.0
+        self.panning = False
+        self.pan_start = None
 
-        # current class id (0~9)
+        # 현재 클래스
         self.current_class = 0
-
-        # 컨트롤 제트
-        self.undo_stack = []
-
-        # 클래스별 색상 매핑
-        self.class_colors = {
+        self.class_colors: dict[int, Qt.GlobalColor] = {
             0: Qt.GlobalColor.yellow,
             1: Qt.GlobalColor.green,
             2: Qt.GlobalColor.red,
             3: Qt.GlobalColor.blue,
-            # 4: Qt.GlobalColor.cyan,
-            # 5: Qt.GlobalColor.magenta,
-            # 6: Qt.GlobalColor.white,
-            # 7: Qt.GlobalColor.gray,
-            # 8: Qt.GlobalColor.darkRed,
-            # 9: Qt.GlobalColor.darkGreen,
         }
 
+        self.setMouseTracking(True)
+
+    # ----------------------------
+    #   기본 설정/조회 함수
+    # ----------------------------
     def set_image(self, pixmap: QPixmap | None):
         self.image = pixmap
         if pixmap is not None:
@@ -63,97 +66,91 @@ class ImageLabel(QLabel):
             self.img_h = pixmap.height()
         else:
             self.img_w = self.img_h = 0
-        # 이미지 바뀌면 줌/패닝 리셋
+
+        # 뷰 리셋
         self.zoom_factor = 1.0
-        self.pan_dx = 0.0
-        self.pan_dy = 0.0
-        self.update()
+        self.pan_dx = self.pan_dy = 0.0
+        self.box_start = None
+        self.box_preview_end = None
+        self.current_polygon = []
+        self.seg_preview_point = None
 
-    def set_boxes(self, boxes):
-        """
-        boxes: list of (cls_id, x1, y1, x2, y2) in pixel coords
-        """
-        self.boxes = boxes
         self.update()
-
-    def get_boxes(self):
-        return self.boxes
 
     def set_current_class(self, cls_id: int):
         self.current_class = int(cls_id)
 
-    def undo(self):
-        """
-        Ctrl+Z → 마지막 작업(박스 추가)을 되돌리기
-        """
-        if not self.undo_stack:
-            return
-
-        action, box = self.undo_stack.pop()
-
-        if action == "add":
-            # 마지막 생성된 박스를 제거
-            if box in self.boxes:
-                self.boxes.remove(box)
-
+    def set_boxes(self, boxes):
+        self.boxes = list(boxes)
+        # 박스 설정 시 진행 중이던 것 초기화
+        self.box_start = None
+        self.box_preview_end = None
         self.update()
 
+    def set_polygons(self, polygons):
+        # 깊은 복사 수준까진 아니어도 list copy
+        self.polygons = [(cls, list(pts)) for cls, pts in polygons]
+        self.current_polygon = []
+        self.seg_preview_point = None
+        self.update()
 
+    def get_boxes(self):
+        return list(self.boxes)
+
+    def get_polygons(self):
+        return [(cls, list(pts)) for cls, pts in self.polygons]
+
+    # ----------------------------
+    #   마우스 이벤트
+    # ----------------------------
     def mousePressEvent(self, event):
-        if self.window():
-            self.window().setFocus()
-
         if self.image is None:
             return
 
-        # 위치 변환
-        x, y = self._map_to_image(event.position())
+        mods = event.modifiers()
+        pos = event.position()
+
+        # Ctrl + 좌클릭 → 패닝 시작
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and (mods & Qt.KeyboardModifier.ControlModifier)
+        ):
+            self.panning = True
+            self.pan_start = pos
+            return
+
+        x, y = self._map_to_image(pos)
         if x is None:
             return
 
-        # 우클릭은 삭제 그대로 유지
+        # 우클릭
         if event.button() == Qt.MouseButton.RightButton:
-            removed = False
-            for i in range(len(self.boxes) - 1, -1, -1):
-                cls_id, x1, y1, x2, y2 = self.boxes[i]
-                if (x1 <= x <= x2) and (y1 <= y <= y2):
-                    del self.boxes[i]
-                    removed = True
-                    break
-            if removed:
-                self.update()
+            if self.mode == "bbox":
+                self._delete_bbox_at(x, y)
+            else:
+                self._delete_seg_point_at(x, y)
             return
 
-        # 좌클릭 → 두 번 클릭 방식
+        # 좌클릭
         if event.button() == Qt.MouseButton.LeftButton:
-            # 첫 클릭 (시작점)
-            if not self.drawing:
-                self.start_pos = (x, y)
-                self.drawing = True
-                self.current_box = None
-            # 두 번째 클릭 (완료)
+            if self.mode == "bbox":
+                self._bbox_click(x, y)
             else:
-                x1, y1 = self.start_pos
-                x2, y2 = x, y
-                x_min, x_max = sorted([x1, x2])
-                y_min, y_max = sorted([y1, y2])
+                self._seg_add_point(x, y)
 
-                new_box = (self.current_class, x_min, y_min, x_max, y_max)
-                self.boxes.append(new_box)
-
-                # undo 스택에 추가
-                self.undo_stack.append(("add", new_box))
-
-                # 초기화
-                self.drawing = False
-                self.start_pos = None
-                self.current_box = None
-
-                self.update()
-
+    def mouseDoubleClickEvent(self, event):
+        # 세그 모드에서 더블클릭 → 폴리곤 닫기
+        if (
+            self.mode == "seg"
+            and event.button() == Qt.MouseButton.LeftButton
+            and len(self.current_polygon) >= 3
+        ):
+            self.finish_polygon()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event):
-        # 드래그 기반 패닝 그대로 유지
         if self.panning and self.pan_start is not None:
             delta = event.position() - self.pan_start
             self.pan_start = event.position()
@@ -162,105 +159,240 @@ class ImageLabel(QLabel):
             self.update()
             return
 
-        # 첫 클릭 이후 마우스를 움직이면 박스 미리보기
-        if self.drawing and self.start_pos is not None:
-            x, y = self._map_to_image(event.position())
-            if x is None:
-                return
-            x1, y1 = self.start_pos
-            self.current_box = (x1, y1, x, y)
+        if self.image is None:
+            return
+
+        x, y = self._map_to_image(event.position())
+        if x is None:
+            return
+
+        # BBox 프리뷰
+        if self.mode == "bbox" and self.box_start is not None:
+            self.box_preview_end = (x, y)
+            self.update()
+            return
+
+        # Seg 프리뷰: 마지막 점에서 마우스까지 라인
+        if self.mode == "seg" and len(self.current_polygon) > 0:
+            self.seg_preview_point = (x, y)
             self.update()
 
-
     def mouseReleaseEvent(self, event):
-        # 패닝 종료만 유지
         if event.button() == Qt.MouseButton.LeftButton and self.panning:
             self.panning = False
             self.pan_start = None
 
-
-        def wheelEvent(self, event):
-            # 이미지가 없으면 줌 동작 안 함
-            if self.image is None or self.img_w == 0 or self.img_h == 0:
-                return
-
-            delta = event.angleDelta().y()
-            if delta > 0:
-                self.zoom_factor *= 1.1
-            elif delta < 0:
-                self.zoom_factor /= 1.1
-
-        # 줌 한계 설정
-        self.zoom_factor = max(0.2, min(self.zoom_factor, 10.0))
+    # ----------------------------
+    #   휠 줌
+    # ----------------------------
+    def wheelEvent(self, event):
+        if self.image is None or self.img_w == 0 or self.img_h == 0:
+            return
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.zoom_factor *= 1.1
+        elif delta < 0:
+            self.zoom_factor /= 1.1
+        self.zoom_factor = max(0.1, min(self.zoom_factor, 10.0))
         self.update()
 
+    # ----------------------------
+    #   그리기
+    # ----------------------------
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
 
-        if self.image is not None:
-            label_w = self.width()
-            label_h = self.height()
+        if self.image is None or self.img_w == 0 or self.img_h == 0:
+            return
 
-            if self.img_w == 0 or self.img_h == 0:
+        label_w = self.width()
+        label_h = self.height()
+
+        self.base_scale = min(label_w / self.img_w, label_h / self.img_h)
+        self.scale = self.base_scale * self.zoom_factor
+
+        draw_w = self.img_w * self.scale
+        draw_h = self.img_h * self.scale
+
+        self.offset_x = (label_w - draw_w) / 2 + self.pan_dx
+        self.offset_y = (label_h - draw_h) / 2 + self.pan_dy
+
+        # 이미지
+        target_rect = QRectF(self.offset_x, self.offset_y, draw_w, draw_h)
+        source_rect = QRectF(0, 0, self.img_w, self.img_h)
+        painter.drawPixmap(target_rect, self.image, source_rect)
+
+        # --------- Seg: 확정된 폴리곤 채우기 + 테두리 ---------
+        for cls_id, pts in self.polygons:
+            if len(pts) < 3:
+                continue
+            color = QColor(self.class_colors.get(cls_id, Qt.GlobalColor.red))
+            fill_color = QColor(color.red(), color.green(), color.blue(), 80)  # 투명도 80
+
+            qpoints = []
+            for (x, y) in pts:
+                px = self.offset_x + x * self.scale
+                py = self.offset_y + y * self.scale
+                qpoints.append(QPointF(px, py))
+
+            poly = QPolygonF(qpoints)
+            painter.setBrush(fill_color)
+            painter.setPen(QPen(color, 2))
+            painter.drawPolygon(poly)
+
+        # --------- BBox 박스들 ---------
+        for cls_id, x1, y1, x2, y2 in self.boxes:
+            color = self.class_colors.get(cls_id, Qt.GlobalColor.red)
+            pen = QPen(color, 2)
+            painter.setPen(pen)
+
+            rx1 = self.offset_x + x1 * self.scale
+            ry1 = self.offset_y + y1 * self.scale
+            rx2 = self.offset_x + x2 * self.scale
+            ry2 = self.offset_y + y2 * self.scale
+            painter.drawRect(QRectF(rx1, ry1, rx2 - rx1, ry2 - ry1))
+
+        # --------- BBox 프리뷰 박스 ---------
+        if self.mode == "bbox" and self.box_start is not None and self.box_preview_end is not None:
+            x1, y1 = self.box_start
+            x2, y2 = self.box_preview_end
+            x_min, x_max = sorted([x1, x2])
+            y_min, y_max = sorted([y1, y2])
+
+            color = self.class_colors.get(self.current_class, Qt.GlobalColor.white)
+            pen = QPen(color, 2, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+
+            rx1 = self.offset_x + x_min * self.scale
+            ry1 = self.offset_y + y_min * self.scale
+            rw = (x_max - x_min) * self.scale
+            rh = (y_max - y_min) * self.scale
+            painter.drawRect(QRectF(rx1, ry1, rw, rh))
+
+        # --------- Seg: 현재 그리고 있는 폴리곤 선 ---------
+        if self.mode == "seg" and len(self.current_polygon) > 0:
+            color = self.class_colors.get(self.current_class, Qt.GlobalColor.white)
+            pen = QPen(color, 2)
+            painter.setPen(pen)
+
+            # 클릭으로 만든 점들 사이 선
+            for i in range(len(self.current_polygon) - 1):
+                x1, y1 = self.current_polygon[i]
+                x2, y2 = self.current_polygon[i + 1]
+                sx1 = self.offset_x + x1 * self.scale
+                sy1 = self.offset_y + y1 * self.scale
+                sx2 = self.offset_x + x2 * self.scale
+                sy2 = self.offset_y + y2 * self.scale
+                painter.drawLine(QPointF(sx1, sy1), QPointF(sx2, sy2))
+
+            # 마지막 점 → 마우스 위치 프리뷰
+            if self.seg_preview_point is not None:
+                x1, y1 = self.current_polygon[-1]
+                x2, y2 = self.seg_preview_point
+                sx1 = self.offset_x + x1 * self.scale
+                sy1 = self.offset_y + y1 * self.scale
+                sx2 = self.offset_x + x2 * self.scale
+                sy2 = self.offset_y + y2 * self.scale
+                painter.drawLine(QPointF(sx1, sy1), QPointF(sx2, sy2))
+
+    # ----------------------------
+    #   BBox 모드 로직
+    # ----------------------------
+    def _bbox_click(self, x, y):
+        # 첫 클릭: 시작점
+        if self.box_start is None:
+            self.box_start = (x, y)
+            self.box_preview_end = None
+        # 두 번째 클릭: 박스 확정
+        else:
+            x1, y1 = self.box_start
+            x2, y2 = x, y
+            x_min, x_max = sorted([x1, x2])
+            y_min, y_max = sorted([y1, y2])
+
+            # 너무 작은 박스는 무시(옵션)
+            if (x_max - x_min) > 1 and (y_max - y_min) > 1:
+                self.boxes.append((self.current_class, x_min, y_min, x_max, y_max))
+
+            self.box_start = None
+            self.box_preview_end = None
+            self.update()
+
+    def _delete_bbox_at(self, x, y):
+        # 최근 것부터 탐색
+        for i in range(len(self.boxes) - 1, -1, -1):
+            cls_id, x1, y1, x2, y2 = self.boxes[i]
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                del self.boxes[i]
+                break
+        self.update()
+
+    def undo_bbox(self):
+        if self.box_start is not None:
+            # 진행 중이던 박스 취소
+            self.box_start = None
+            self.box_preview_end = None
+        elif self.boxes:
+            self.boxes.pop()
+        self.update()
+
+    # ----------------------------
+    #   Seg 모드 로직
+    # ----------------------------
+    def _seg_add_point(self, x, y):
+        self.current_polygon.append((x, y))
+        self.seg_preview_point = None
+        self.update()
+
+    def finish_polygon(self):
+        if len(self.current_polygon) >= 3:
+            self.polygons.append((self.current_class, list(self.current_polygon)))
+        self.current_polygon = []
+        self.seg_preview_point = None
+        self.update()
+
+    def _delete_seg_point_at(self, x, y, threshold=5.0):
+        # threshold는 이미지 픽셀 기준
+        thr2 = threshold * threshold
+
+        # 먼저 점 삭제
+        for poly_idx, (cls_id, pts) in enumerate(self.polygons):
+            for i, (px, py) in enumerate(pts):
+                dx = x - px
+                dy = y - py
+                if dx * dx + dy * dy <= thr2:
+                    # 점 삭제
+                    del pts[i]
+                    if len(pts) < 3:
+                        # 너무 작아지면 폴리곤 자체 제거
+                        del self.polygons[poly_idx]
+                    self.update()
+                    return
+
+        # current_polygon 쪽 점 삭제 (진행 중인 폴리곤에 대해서도)
+        for i, (px, py) in enumerate(self.current_polygon):
+            dx = x - px
+            dy = y - py
+            if dx * dx + dy * dy <= thr2:
+                del self.current_polygon[i]
+                self.update()
                 return
 
-            # 기본 스케일 (전체 이미지가 보이도록)
-            scale_x = label_w / self.img_w
-            scale_y = label_h / self.img_h
-            self.base_scale = min(scale_x, scale_y)
+    def undo_seg(self):
+        # 진행 중인 폴리곤이면 마지막 점 삭제
+        if self.current_polygon:
+            self.current_polygon.pop()
+            self.seg_preview_point = None
+        # 아니면 마지막 확정 폴리곤 삭제
+        elif self.polygons:
+            self.polygons.pop()
+        self.update()
 
-            # 줌 반영한 최종 스케일
-            self.scale = self.base_scale * self.zoom_factor
-
-            draw_w = self.img_w * self.scale
-            draw_h = self.img_h * self.scale
-
-            # 기본은 중앙 정렬, 여기에 pan_dx/pan_dy 더함
-            base_off_x = (label_w - draw_w) / 2
-            base_off_y = (label_h - draw_h) / 2
-
-            self.offset_x = base_off_x + self.pan_dx
-            self.offset_y = base_off_y + self.pan_dy
-
-            target_rect = QRectF(
-                self.offset_x, self.offset_y,
-                draw_w, draw_h
-            )
-            source_rect = QRectF(self.image.rect())
-            painter.drawPixmap(target_rect, self.image, source_rect)
-
-            # 박스들 그리기
-            for cls_id, x1, y1, x2, y2 in self.boxes:
-                color = self.class_colors.get(cls_id, Qt.GlobalColor.red)
-                pen = QPen(color)
-                pen.setWidth(2)
-                painter.setPen(pen)
-
-                rx1 = self.offset_x + x1 * self.scale
-                ry1 = self.offset_y + y1 * self.scale
-                rx2 = self.offset_x + x2 * self.scale
-                ry2 = self.offset_y + y2 * self.scale
-                painter.drawRect(QRectF(rx1, ry1, rx2 - rx1, ry2 - ry1))
-
-            # 드래그 중인 박스 (현재 클래스 색으로)
-            if self.current_box is not None:
-                x1, y1, x2, y2 = self.current_box
-                color = self.class_colors.get(self.current_class, Qt.GlobalColor.white)
-                pen = QPen(color)
-                pen.setWidth(2)
-                painter.setPen(pen)
-
-                rx1 = self.offset_x + x1 * self.scale
-                ry1 = self.offset_y + y1 * self.scale
-                rx2 = self.offset_x + x2 * self.scale
-                ry2 = self.offset_y + y2 * self.scale
-                painter.drawRect(QRectF(rx1, ry1, rx2 - rx1, ry2 - ry1))
-
+    # ----------------------------
+    #   좌표 변환
+    # ----------------------------
     def _map_to_image(self, pos):
-        """
-        라벨 좌표(QPointF) → 원본 이미지 좌표(float)
-        """
         if self.image is None or self.scale == 0:
             return None, None
         x = (pos.x() - self.offset_x) / self.scale
@@ -270,94 +402,107 @@ class ImageLabel(QLabel):
         return x, y
 
 
-def yolo_to_boxes(label_path, img_w, img_h):
+# ==========================
+# YOLO 포맷 변환 함수
+# ==========================
+def yolo_from_boxes(boxes, img_w, img_h):
     """
-    YOLO 포맷 txt → [(cls_id, x1, y1, x2, y2), ...]
-    """
-    boxes = []
-    if not os.path.exists(label_path):
-        return boxes
-    with open(label_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split()
-            if len(parts) != 5:
-                continue
-            cls_id, xc, yc, w, h = parts
-            cls_id = int(cls_id)
-            xc = float(xc) * img_w
-            yc = float(yc) * img_h
-            w = float(w) * img_w
-            h = float(h) * img_h
-            x1 = xc - w / 2
-            y1 = yc - h / 2
-            x2 = xc + w / 2
-            y2 = yc + h / 2
-            boxes.append((cls_id, x1, y1, x2, y2))
-    return boxes
-
-
-def boxes_to_yolo(boxes, img_w, img_h):
-    """
-    [(cls_id, x1, y1, x2, y2), ...] → YOLO 포맷 문자열
+    boxes: [(cls, x1,y1,x2,y2), ...] in pixel
+    → "cls xc yc w h" (정규화) 줄들을 합친 문자열
     """
     lines = []
     for cls_id, x1, y1, x2, y2 in boxes:
         w = (x2 - x1) / img_w
         h = (y2 - y1) / img_h
-        xc = (x1 + x2) / 2 / img_w
-        yc = (y1 + y2) / 2 / img_h
+        xc = ((x1 + x2) / 2) / img_w
+        yc = ((y1 + y2) / 2) / img_h
         lines.append(f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
     return "\n".join(lines)
 
 
+def yolo_from_polygons(polygons, img_w, img_h):
+    """
+    polygons: [(cls, [(x,y),...]), ...] in pixel
+    → "cls x1 y1 x2 y2 ... xn yn" (정규화) 줄들을 합친 문자열
+    """
+    lines = []
+    for cls_id, pts in polygons:
+        coords = []
+        for x, y in pts:
+            coords.append(f"{x / img_w:.6f}")
+            coords.append(f"{y / img_h:.6f}")
+        lines.append(f"{cls_id} " + " ".join(coords))
+    return "\n".join(lines)
+
+
+# ==========================
+#   메인 툴
+# ==========================
 class LabelingTool(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("YOLO Labeling Tool (PyQt6)")
+        self.setWindowTitle("YOLO BBox + Seg Labeling Tool")
 
         self.image_dir = ""
         self.label_dir = ""
         self.image_files: list[str] = []
         self.current_index = -1
+        self.last_enter_time = 0
 
-        # 현재 클래스 id (0~9)
-        self.current_class = 0
+        # 캐시
+        self.label_cache_boxes: dict[str, list] = {}
+        self.label_cache_polygons: dict[str, list] = {}
+        self.modified_images: set[str] = set()
 
-        # 이미지별 임시 박스 캐시: {img_name: boxes}
-        self.label_cache = {}
-
-        # 라벨을 수정/확인한 이미지 집합(체크 표시용)
-        self.modified_images = set()
+        self.mode = "bbox"
 
         self.init_ui()
+        self.choose_mode_popup()
 
+    # ----------------------------
+    #   모드 선택 팝업
+    # ----------------------------
+    def choose_mode_popup(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("라벨링 모드 선택")
+        box.setText("어떤 라벨링 방식을 사용하시겠습니까?")
+        bbox_button = box.addButton("Bounding Box", QMessageBox.ButtonRole.AcceptRole)
+        seg_button = box.addButton("Segmentation", QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(bbox_button)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked == seg_button:
+            self.mode = "seg"
+        else:
+            self.mode = "bbox"
+
+        self.image_label.mode = self.mode
+
+    # ----------------------------
+    #   UI 구성
+    # ----------------------------
     def init_ui(self):
         main_widget = QWidget()
         main_layout = QHBoxLayout(main_widget)
 
-        # 메인 윈도우가 키보드 포커스를 받을 수 있게 설정
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-
-        # 왼쪽: 폴더 버튼 + 현재 클래스 표시 + 이미지 리스트 + 저장 버튼
+        # 왼쪽 패널
         left_layout = QVBoxLayout()
-        self.list_widget = QListWidget()
-        self.list_widget.currentRowChanged.connect(self.on_list_changed)
-
         btn_img_dir = QPushButton("이미지 폴더 선택")
         btn_img_dir.clicked.connect(self.select_image_dir)
         btn_lbl_dir = QPushButton("라벨 폴더 선택")
         btn_lbl_dir.clicked.connect(self.select_label_dir)
 
-        self.class_label = QLabel(f"현재 클래스: {self.current_class}")
+        self.class_label = QLabel("현재 클래스: 0")
+
+        self.list_widget = QListWidget()
+        self.list_widget.currentRowChanged.connect(self.on_list_changed)
 
         self.clear_button = QPushButton("현재 이미지 라벨 삭제")
         self.clear_button.clicked.connect(self.clear_current_labels)
 
-        self.save_button = QPushButton("현재 이미지 저장")
-        self.save_button.clicked.connect(self.save_current_image)
+        self.save_button = QPushButton("전체 저장")
+        self.save_button.clicked.connect(self.save_all)
 
         left_layout.addWidget(btn_img_dir)
         left_layout.addWidget(btn_lbl_dir)
@@ -365,40 +510,79 @@ class LabelingTool(QMainWindow):
         left_layout.addWidget(self.list_widget)
         left_layout.addWidget(self.clear_button)
         left_layout.addWidget(self.save_button)
-        
 
-        # 중앙: 이미지 라벨 위젯
+        # 이미지 영역
         self.image_label = ImageLabel()
         self.image_label.setStyleSheet("background-color: black;")
-        self.image_label.set_current_class(self.current_class)
 
         main_layout.addLayout(left_layout, 1)
         main_layout.addWidget(self.image_label, 4)
 
         self.setCentralWidget(main_widget)
-        self.resize(1400, 800)
+        self.resize(1500, 900)
 
+    # ----------------------------
+    #   키 입력
+    # ----------------------------
     def keyPressEvent(self, event):
         key = event.key()
+        mods = event.modifiers()
 
-        # 다음/이전 이미지
-        if key == Qt.Key.Key_Right:
+        # 클래스 변경 (0~9)
+        if Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+            cls_id = key - Qt.Key.Key_0
+            self.image_label.set_current_class(cls_id)
+            self.class_label.setText(f"현재 클래스: {cls_id}")
+
+        # Ctrl+Z → Undo
+        elif (mods & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_Z:
+            if self.mode == "bbox":
+                self.image_label.undo_bbox()
+            else:
+                self.image_label.undo_seg()
+
+        # Enter → 세그 폴리곤 닫기
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.mode == "seg":
+                import time
+                current_time = time.time()
+
+                # ─────────────────────────
+                # 1) 더블 엔터 감지 (0.25초 이내 두 번)
+                # ─────────────────────────
+                if current_time - self.last_enter_time < 0.25:
+                    # 더블 엔터 → 폴리곤 닫기
+                    self.image_label.finish_polygon()
+                    self.last_enter_time = 0
+                    return
+                else:
+                    self.last_enter_time = current_time
+
+                # ─────────────────────────
+                # 2) 일반 엔터 → 현재 마우스 위치에 점 추가
+                # ─────────────────────────
+                cursor_pos = self.image_label.mapFromGlobal(QCursor.pos())
+                x, y = self.image_label._map_to_image(cursor_pos)
+
+                if x is not None:
+                    self.image_label.current_polygon.append((x, y))
+                    self.image_label.seg_preview_point = None
+                    self.image_label.update()
+
+
+
+
+        # 좌우 화살표 → 이전/다음 이미지
+        elif key == Qt.Key.Key_Right:
             self.next_image()
         elif key == Qt.Key.Key_Left:
             self.prev_image()
-        # 숫자 키로 클래스 선택 (0~9)
-        elif Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
-            cls_id = key - Qt.Key.Key_0
-            self.current_class = cls_id
-            self.image_label.set_current_class(cls_id)
-            self.class_label.setText(f"현재 클래스: {cls_id}")
-        # Ctrl + Z → Undo
-        elif (event.modifiers() & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_Z:
-            self.image_label.undo()
-
         else:
             super().keyPressEvent(event)
 
+    # ----------------------------
+    #   폴더 선택
+    # ----------------------------
     def select_image_dir(self):
         d = QFileDialog.getExistingDirectory(self, "이미지 폴더 선택")
         if d:
@@ -409,17 +593,12 @@ class LabelingTool(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "라벨 폴더 선택")
         if d:
             self.label_dir = d
-
-            # 현재 이미지 캐시 제거
             if self.image_files and self.current_index != -1:
-                img_name = self.image_files[self.current_index]
-                if img_name in self.label_cache:
-                    del self.label_cache[img_name]
+                self.load_current_image(force_reload=True)
 
-            # 강제로 라벨 포함해 다시 로딩
-            if self.image_files and self.current_index != -1:
-                self.load_current_image()
-
+    # ----------------------------
+    #   이미지 리스트 로드
+    # ----------------------------
     def load_image_list(self):
         if not self.image_dir:
             return
@@ -429,38 +608,31 @@ class LabelingTool(QMainWindow):
             if os.path.splitext(f)[1].lower() in exts
         ]
 
-        # 새 이미지 폴더 선택하면 캐시/체크 상태 초기화
-        self.label_cache.clear()
-        self.modified_images.clear()
-
         self.list_widget.clear()
         self.list_widget.addItems(self.image_files)
 
-        # 리스트 아이템을 체크 가능하게 만들기
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
+        self.label_cache_boxes.clear()
+        self.label_cache_polygons.clear()
+        self.modified_images.clear()
 
         if self.image_files:
             self.current_index = 0
             self.list_widget.setCurrentRow(0)
-            self.load_current_image()
+            self.load_current_image(force_reload=True)
 
     def on_list_changed(self, row: int):
         if row < 0 or row >= len(self.image_files):
             return
 
-        # 1) 현재 보이던 이미지(이전 인덱스)에 대한 캐시 저장
-        if 0 <= self.current_index < len(self.image_files):
-            self.update_cache_for_current_image()
+        # 현재 이미지 캐시 저장
+        self.update_cache_for_current_image()
 
-        # 2) 인덱스 갱신
         self.current_index = row
-
-        # 3) 새 이미지 로드
         self.load_current_image()
 
+    # ----------------------------
+    #   현재 이미지/라벨 로드
+    # ----------------------------
     def current_image_path(self):
         if self.current_index < 0 or self.current_index >= len(self.image_files):
             return None
@@ -473,34 +645,80 @@ class LabelingTool(QMainWindow):
         base, _ = os.path.splitext(img_name)
         return os.path.join(self.label_dir, base + ".txt")
 
-    def update_cache_for_current_image(self):
-        """현재 화면에 그려진 박스를 캐시에 저장 (파일에는 안 씀)"""
-        if self.current_index < 0 or not self.image_files:
+    def load_current_image(self, force_reload: bool = False):
+        img_path = self.current_image_path()
+        if not img_path:
             return
+        pix = QPixmap(img_path)
+        if pix.isNull():
+            return
+
+        self.image_label.set_image(pix)
 
         img_name = self.image_files[self.current_index]
-        boxes = self.image_label.get_boxes()
 
-        # 얕은 복사해서 보관
-        self.label_cache[img_name] = list(boxes)
-
-        # 수정된/확인된 이미지로 표시
-        self.modified_images.add(img_name)
-        item = self.list_widget.item(self.current_index)
-        if item is not None:
-            item.setCheckState(Qt.CheckState.Checked)
-    
-    def clear_current_labels(self):
-        """
-        현재 이미지의 바운딩박스를 모두 제거하는 버튼 동작
-        - 화면에서 박스 삭제
-        - 캐시에도 빈 리스트로 반영
-        - 수정된 이미지로 체크 표시 유지
-        """
-        if self.current_index < 0 or not self.image_files:
+        # 캐시 우선
+        if not force_reload and (
+            img_name in self.label_cache_boxes or img_name in self.label_cache_polygons
+        ):
+            self.image_label.set_boxes(self.label_cache_boxes.get(img_name, []))
+            self.image_label.set_polygons(self.label_cache_polygons.get(img_name, []))
             return
 
-        # 선택 확인 팝업 (원하면 빼도 됨)
+        # 라벨 파일에서 로드
+        boxes = []
+        polygons = []
+
+        lbl_path = self.current_label_path()
+        if lbl_path and os.path.exists(lbl_path):
+            with open(lbl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    cls_id = int(parts[0])
+
+                    # bbox: cls xc yc w h
+                    if len(parts) == 5:
+                        xc, yc, w, h = map(float, parts[1:])
+                        x1 = (xc - w / 2) * self.image_label.img_w
+                        y1 = (yc - h / 2) * self.image_label.img_h
+                        x2 = (xc + w / 2) * self.image_label.img_w
+                        y2 = (yc + h / 2) * self.image_label.img_h
+                        boxes.append((cls_id, x1, y1, x2, y2))
+                    # seg: cls x1 y1 x2 y2 ... xn yn
+                    elif len(parts) > 5 and len(parts[1:]) % 2 == 0:
+                        coords = list(map(float, parts[1:]))
+                        pts = []
+                        for i in range(0, len(coords), 2):
+                            x = coords[i] * self.image_label.img_w
+                            y = coords[i + 1] * self.image_label.img_h
+                            pts.append((x, y))
+                        if len(pts) >= 3:
+                            polygons.append((cls_id, pts))
+
+        self.image_label.set_boxes(boxes)
+        self.image_label.set_polygons(polygons)
+        self.image_label.setFocus()   # 이미지가 바뀔 때마다 포커스를 Label로 지정
+
+    # ----------------------------
+    #   캐시/체크
+    # ----------------------------
+    def update_cache_for_current_image(self):
+        if self.current_index < 0 or not self.image_files:
+            return
+        img_name = self.image_files[self.current_index]
+        self.label_cache_boxes[img_name] = self.image_label.get_boxes()
+        self.label_cache_polygons[img_name] = self.image_label.get_polygons()
+        self.modified_images.add(img_name)
+
+    # ----------------------------
+    #   라벨 삭제
+    # ----------------------------
+    def clear_current_labels(self):
+        if self.current_index < 0:
+            return
         reply = QMessageBox.question(
             self,
             "라벨 삭제 확인",
@@ -511,96 +729,62 @@ class LabelingTool(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # 1) 화면에서 박스 모두 제거
         self.image_label.set_boxes([])
-
-        # 2) 캐시/체크 상태 업데이트
+        self.image_label.set_polygons([])
         self.update_cache_for_current_image()
 
-
-    def load_current_image(self):
-        img_path = self.current_image_path()
-        if not img_path:
-            return
-        pixmap = QPixmap(img_path)
-        self.image_label.set_image(pixmap)
-
-        img_name = self.image_files[self.current_index]
-        boxes = []
-
-        # 이미 수정한 이미지라면 체크 표시 유지
-        item = self.list_widget.item(self.current_index)
-        if item is not None:
-            if img_name in self.modified_images:
-                item.setCheckState(Qt.CheckState.Checked)
-            else:
-                # 필요하다면 수정 안 된 건 Unchecked로
-                # item.setCheckState(Qt.CheckState.Unchecked)
-                pass
-
-        # 1순위: 캐시
-        if img_name in self.label_cache:
-            boxes = self.label_cache[img_name]
-        else:
-            lbl_path = self.current_label_path()
-            if lbl_path and os.path.exists(lbl_path):
-                boxes = yolo_to_boxes(lbl_path, self.image_label.img_w, self.image_label.img_h)
-
-        self.image_label.set_boxes(boxes)
-
-
-    def save_current_image(self):
-        """
-        Save 버튼 클릭 시:
-        - 현재 이미지 포함, 지금까지 수정/체크된 모든 이미지의 라벨을
-          txt 파일로 덮어쓰기 저장
-        - 몇 개 저장됐는지 팝업으로 알려줌
-        """
+    # ----------------------------
+    #   저장
+    # ----------------------------
+    def save_all(self):
         if not self.label_dir:
+            QMessageBox.warning(self, "경고", "라벨 폴더를 먼저 선택하세요.")
             return
 
-        # 현재 화면에 보이는 것도 캐시에 반영
+        # 현재 화면도 캐시에 반영
         self.update_cache_for_current_image()
-
-        if not self.modified_images:
-            QMessageBox.information(self, "저장", "수정된 이미지가 없습니다.")
-            return
 
         os.makedirs(self.label_dir, exist_ok=True)
 
         saved = 0
-        for img_name in sorted(self.modified_images):
-            boxes = self.label_cache.get(img_name, [])
-
-            # 각 이미지의 원본 크기 필요 → 직접 로드
+        for img_name in self.modified_images:
             img_path = os.path.join(self.image_dir, img_name)
-            pixmap = QPixmap(img_path)
-            if pixmap.isNull():
+            pix = QPixmap(img_path)
+            if pix.isNull():
                 continue
-            img_w = pixmap.width()
-            img_h = pixmap.height()
-            if img_w == 0 or img_h == 0:
-                continue
+            img_w = pix.width()
+            img_h = pix.height()
 
-            base, _ = os.path.splitext(img_name)
-            lbl_path = os.path.join(self.label_dir, base + ".txt")
+            boxes = self.label_cache_boxes.get(img_name, [])
+            polygons = self.label_cache_polygons.get(img_name, [])
 
-            yolo_txt = boxes_to_yolo(boxes, img_w, img_h)
+            lines = []
+            if boxes:
+                lines.extend(yolo_from_boxes(boxes, img_w, img_h).splitlines())
+            if polygons:
+                lines.extend(yolo_from_polygons(polygons, img_w, img_h).splitlines())
+
+            lbl_path = os.path.join(
+                self.label_dir,
+                os.path.splitext(img_name)[0] + ".txt"
+            )
             with open(lbl_path, "w", encoding="utf-8") as f:
-                f.write(yolo_txt)
+                f.write("\n".join(lines))
             saved += 1
 
         QMessageBox.information(
             self,
             "저장 완료",
-            f"체크된 이미지 {len(self.modified_images)}개 중 {saved}개를 저장했습니다."
+            f"{saved}개 이미지에 대해 라벨을 저장했습니다.",
         )
 
+    # ----------------------------
+    #   prev / next
+    # ----------------------------
     def next_image(self):
         if not self.image_files:
             return
         if self.current_index < len(self.image_files) - 1:
-            # 인덱스는 여기서 건드리지 않고, 선택만 변경
             self.list_widget.setCurrentRow(self.current_index + 1)
 
     def prev_image(self):
@@ -609,6 +793,9 @@ class LabelingTool(QMainWindow):
         if self.current_index > 0:
             self.list_widget.setCurrentRow(self.current_index - 1)
 
+    # ----------------------------
+    #   종료 확인
+    # ----------------------------
     def closeEvent(self, event):
         reply = QMessageBox.question(
             self,
@@ -617,12 +804,15 @@ class LabelingTool(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-
         if reply == QMessageBox.StandardButton.Yes:
-            event.accept()   # 진짜 닫기
+            event.accept()
         else:
-            event.ignore()   # 닫기 취소
+            event.ignore()
 
+
+# ==========================
+#   main
+# ==========================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = LabelingTool()

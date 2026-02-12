@@ -1,12 +1,12 @@
 import sys
 import os
+import shutil
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QListWidget, QFileDialog, QMessageBox
 )
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QPolygonF, QCursor
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QPolygonF, QCursor, QFont
 from PyQt6.QtCore import Qt, QRectF, QPointF
-
 
 
 # ==========================
@@ -110,7 +110,7 @@ class ImageLabel(QLabel):
         mods = event.modifiers()
         pos = event.position()
 
-        # Ctrl + 좌클릭 → 패닝 시작
+        # Ctrl + 좌클릭 -> 패닝 시작
         if (
             event.button() == Qt.MouseButton.LeftButton
             and (mods & Qt.KeyboardModifier.ControlModifier)
@@ -139,7 +139,7 @@ class ImageLabel(QLabel):
                 self._seg_add_point(x, y)
 
     def mouseDoubleClickEvent(self, event):
-        # 세그 모드에서 더블클릭 → 폴리곤 닫기
+        # 세그 모드에서 더블클릭 -> 폴리곤 닫기
         if (
             self.mode == "seg"
             and event.button() == Qt.MouseButton.LeftButton
@@ -286,7 +286,7 @@ class ImageLabel(QLabel):
                 sy2 = self.offset_y + y2 * self.scale
                 painter.drawLine(QPointF(sx1, sy1), QPointF(sx2, sy2))
 
-            # 마지막 점 → 마우스 위치 프리뷰
+            # 마지막 점 -> 마우스 위치 프리뷰
             if self.seg_preview_point is not None:
                 x1, y1 = self.current_polygon[-1]
                 x2, y2 = self.seg_preview_point
@@ -408,7 +408,7 @@ class ImageLabel(QLabel):
 def yolo_from_boxes(boxes, img_w, img_h):
     """
     boxes: [(cls, x1,y1,x2,y2), ...] in pixel
-    → "cls xc yc w h" (정규화) 줄들을 합친 문자열
+    -> "cls xc yc w h" (정규화) 줄들을 합친 문자열
     """
     lines = []
     for cls_id, x1, y1, x2, y2 in boxes:
@@ -423,7 +423,7 @@ def yolo_from_boxes(boxes, img_w, img_h):
 def yolo_from_polygons(polygons, img_w, img_h):
     """
     polygons: [(cls, [(x,y),...]), ...] in pixel
-    → "cls x1 y1 x2 y2 ... xn yn" (정규화) 줄들을 합친 문자열
+    -> "cls x1 y1 x2 y2 ... xn yn" (정규화) 줄들을 합친 문자열
     """
     lines = []
     for cls_id, pts in polygons:
@@ -453,6 +453,13 @@ class LabelingTool(QMainWindow):
         self.label_cache_boxes: dict[str, list] = {}
         self.label_cache_polygons: dict[str, list] = {}
         self.modified_images: set[str] = set()
+
+        # 원본 스냅샷 (로드 시점의 상태 저장, 변경 비교용)
+        self._original_boxes: dict[str, list] = {}
+        self._original_polygons: dict[str, list] = {}
+
+        # 라벨 완료된 파일명 (확장자 제외 basename) 세트
+        self.labeled_basenames: set[str] = set()
 
         self.mode = "bbox"
 
@@ -492,6 +499,8 @@ class LabelingTool(QMainWindow):
         btn_img_dir.clicked.connect(self.select_image_dir)
         btn_lbl_dir = QPushButton("라벨 폴더 선택")
         btn_lbl_dir.clicked.connect(self.select_label_dir)
+        btn_labeled_dir = QPushButton("라벨된 폴더 선택")
+        btn_labeled_dir.clicked.connect(self.select_labeled_dir)
 
         self.class_label = QLabel("현재 클래스: 0")
 
@@ -506,6 +515,7 @@ class LabelingTool(QMainWindow):
 
         left_layout.addWidget(btn_img_dir)
         left_layout.addWidget(btn_lbl_dir)
+        left_layout.addWidget(btn_labeled_dir)
         left_layout.addWidget(self.class_label)
         left_layout.addWidget(self.list_widget)
         left_layout.addWidget(self.clear_button)
@@ -534,33 +544,29 @@ class LabelingTool(QMainWindow):
             self.image_label.set_current_class(cls_id)
             self.class_label.setText(f"현재 클래스: {cls_id}")
 
-        # Ctrl+Z → Undo
+        # Ctrl+Z -> Undo
         elif (mods & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_Z:
             if self.mode == "bbox":
                 self.image_label.undo_bbox()
             else:
                 self.image_label.undo_seg()
 
-        # Enter → 세그 폴리곤 닫기
+        # Enter -> 세그 폴리곤 닫기
         elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if self.mode == "seg":
                 import time
                 current_time = time.time()
 
-                # ─────────────────────────
-                # 1) 더블 엔터 감지 (0.25초 이내 두 번)
-                # ─────────────────────────
+                # 더블 엔터 감지 (0.25초 이내 두 번)
                 if current_time - self.last_enter_time < 0.25:
-                    # 더블 엔터 → 폴리곤 닫기
+                    # 더블 엔터 -> 폴리곤 닫기
                     self.image_label.finish_polygon()
                     self.last_enter_time = 0
                     return
                 else:
                     self.last_enter_time = current_time
 
-                # ─────────────────────────
-                # 2) 일반 엔터 → 현재 마우스 위치에 점 추가
-                # ─────────────────────────
+                # 일반 엔터 -> 현재 마우스 위치에 점 추가
                 cursor_pos = self.image_label.mapFromGlobal(QCursor.pos())
                 x, y = self.image_label._map_to_image(cursor_pos)
 
@@ -569,10 +575,7 @@ class LabelingTool(QMainWindow):
                     self.image_label.seg_preview_point = None
                     self.image_label.update()
 
-
-
-
-        # 좌우 화살표 → 이전/다음 이미지
+        # 좌우 화살표 -> 이전/다음 이미지
         elif key == Qt.Key.Key_Right:
             self.next_image()
         elif key == Qt.Key.Key_Left:
@@ -596,6 +599,29 @@ class LabelingTool(QMainWindow):
             if self.image_files and self.current_index != -1:
                 self.load_current_image(force_reload=True)
 
+    def select_labeled_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "라벨된 폴더 선택")
+        if d:
+            self.labeled_basenames.clear()
+            for f in os.listdir(d):
+                if f.lower().endswith(".txt"):
+                    base = os.path.splitext(f)[0]
+                    self.labeled_basenames.add(base)
+            self.highlight_labeled_images()
+
+    def highlight_labeled_images(self):
+        """리스트 항목 배경색 갱신: 수정됨(연하늘) > 라벨완료(연노란) > 기본(투명)"""
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            img_name = item.text()
+            base = os.path.splitext(img_name)[0]
+            if img_name in self.modified_images:
+                item.setBackground(QColor(200, 230, 255))  # 연하늘색 (수정됨)
+            elif base in self.labeled_basenames:
+                item.setBackground(QColor(255, 255, 200))  # 연노란색 (라벨 완료)
+            else:
+                item.setBackground(QColor(0, 0, 0, 0))  # 투명 (기본)
+
     # ----------------------------
     #   이미지 리스트 로드
     # ----------------------------
@@ -610,10 +636,13 @@ class LabelingTool(QMainWindow):
 
         self.list_widget.clear()
         self.list_widget.addItems(self.image_files)
+        self.highlight_labeled_images()
 
         self.label_cache_boxes.clear()
         self.label_cache_polygons.clear()
         self.modified_images.clear()
+        self._original_boxes.clear()
+        self._original_polygons.clear()
 
         if self.image_files:
             self.current_index = 0
@@ -663,6 +692,12 @@ class LabelingTool(QMainWindow):
         ):
             self.image_label.set_boxes(self.label_cache_boxes.get(img_name, []))
             self.image_label.set_polygons(self.label_cache_polygons.get(img_name, []))
+            # 원본 스냅샷이 없으면 캐시 값을 원본으로 저장
+            if img_name not in self._original_boxes:
+                cached_boxes = self.label_cache_boxes.get(img_name, [])
+                cached_polys = self.label_cache_polygons.get(img_name, [])
+                self._original_boxes[img_name] = list(cached_boxes)
+                self._original_polygons[img_name] = [(c, list(p)) for c, p in cached_polys]
             return
 
         # 라벨 파일에서 로드
@@ -700,7 +735,12 @@ class LabelingTool(QMainWindow):
 
         self.image_label.set_boxes(boxes)
         self.image_label.set_polygons(polygons)
-        self.image_label.setFocus()   # 이미지가 바뀔 때마다 포커스를 Label로 지정
+
+        # 원본 스냅샷 저장 (변경 비교용)
+        self._original_boxes[img_name] = list(boxes)
+        self._original_polygons[img_name] = [(cls, list(pts)) for cls, pts in polygons]
+
+        self.image_label.setFocus()  # 이미지가 바뀔 때마다 포커스를 Label로 지정
 
     # ----------------------------
     #   캐시/체크
@@ -709,9 +749,26 @@ class LabelingTool(QMainWindow):
         if self.current_index < 0 or not self.image_files:
             return
         img_name = self.image_files[self.current_index]
-        self.label_cache_boxes[img_name] = self.image_label.get_boxes()
-        self.label_cache_polygons[img_name] = self.image_label.get_polygons()
-        self.modified_images.add(img_name)
+
+        current_boxes = self.image_label.get_boxes()
+        current_polygons = self.image_label.get_polygons()
+
+        # 캐시에 현재 상태 저장 (항상)
+        self.label_cache_boxes[img_name] = current_boxes
+        self.label_cache_polygons[img_name] = current_polygons
+
+        # 원본과 비교하여 실제 변경이 있을 때만 modified 처리
+        orig_boxes = self._original_boxes.get(img_name, [])
+        orig_polygons = self._original_polygons.get(img_name, [])
+
+        if current_boxes != orig_boxes or current_polygons != orig_polygons:
+            self.modified_images.add(img_name)
+        else:
+            # 되돌렸을 경우 modified에서 제거
+            self.modified_images.discard(img_name)
+
+        # 리스트 배경색 갱신
+        self.highlight_labeled_images()
 
     # ----------------------------
     #   라벨 삭제
@@ -744,39 +801,104 @@ class LabelingTool(QMainWindow):
         # 현재 화면도 캐시에 반영
         self.update_cache_for_current_image()
 
+        if not self.modified_images:
+            QMessageBox.information(self, "알림", "수정된 라벨이 없습니다.")
+            return
+
+        # 저장 방식 선택 팝업
+        box = QMessageBox(self)
+        box.setWindowTitle("저장 방식 선택")
+        box.setText("어떤 방식으로 저장하시겠습니까?")
+        box.setInformativeText(
+            f"수정된 이미지: {len(self.modified_images)}개\n\n"
+            "덮어쓰기: 기존 라벨 폴더에 덮어씁니다.\n"
+            "별도 저장: 수정된 이미지+라벨을 새 경로에 저장합니다."
+        )
+        btn_overwrite = box.addButton("덮어쓰기 저장", QMessageBox.ButtonRole.AcceptRole)
+        btn_separate = box.addButton("별도 경로 저장", QMessageBox.ButtonRole.AcceptRole)
+        btn_cancel = box.addButton("취소", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_overwrite)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked == btn_cancel:
+            return
+        elif clicked == btn_separate:
+            self._save_to_separate_dir()
+        else:
+            self._save_overwrite()
+
+    def _save_overwrite(self):
+        """기존 라벨 폴더에 덮어쓰기 저장"""
         os.makedirs(self.label_dir, exist_ok=True)
 
         saved = 0
         for img_name in self.modified_images:
-            img_path = os.path.join(self.image_dir, img_name)
-            pix = QPixmap(img_path)
-            if pix.isNull():
-                continue
-            img_w = pix.width()
-            img_h = pix.height()
-
-            boxes = self.label_cache_boxes.get(img_name, [])
-            polygons = self.label_cache_polygons.get(img_name, [])
-
-            lines = []
-            if boxes:
-                lines.extend(yolo_from_boxes(boxes, img_w, img_h).splitlines())
-            if polygons:
-                lines.extend(yolo_from_polygons(polygons, img_w, img_h).splitlines())
-
-            lbl_path = os.path.join(
-                self.label_dir,
-                os.path.splitext(img_name)[0] + ".txt"
-            )
-            with open(lbl_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-            saved += 1
+            if self._save_label_for_image(img_name, self.label_dir):
+                saved += 1
 
         QMessageBox.information(
             self,
             "저장 완료",
-            f"{saved}개 이미지에 대해 라벨을 저장했습니다.",
+            f"{saved}개 이미지에 대해 라벨을 덮어쓰기 저장했습니다.",
         )
+
+    def _save_to_separate_dir(self):
+        """수정된 이미지+라벨을 별도 경로에 저장"""
+        target_dir = QFileDialog.getExistingDirectory(self, "저장할 폴더 선택")
+        if not target_dir:
+            return
+
+        img_out = os.path.join(target_dir, "images")
+        lbl_out = os.path.join(target_dir, "labels")
+        os.makedirs(img_out, exist_ok=True)
+        os.makedirs(lbl_out, exist_ok=True)
+
+        saved = 0
+        for img_name in self.modified_images:
+            # 이미지 복사
+            src_img = os.path.join(self.image_dir, img_name)
+            dst_img = os.path.join(img_out, img_name)
+            if os.path.exists(src_img):
+                shutil.copy2(src_img, dst_img)
+
+            # 라벨 저장
+            if self._save_label_for_image(img_name, lbl_out):
+                saved += 1
+
+        QMessageBox.information(
+            self,
+            "저장 완료",
+            f"{saved}개 수정된 이미지+라벨을 별도 저장했습니다.\n"
+            f"이미지: {img_out}\n"
+            f"라벨: {lbl_out}",
+        )
+
+    def _save_label_for_image(self, img_name, label_dir):
+        """개별 이미지에 대한 라벨 파일 저장 (공통 로직)"""
+        img_path = os.path.join(self.image_dir, img_name)
+        pix = QPixmap(img_path)
+        if pix.isNull():
+            return False
+        img_w = pix.width()
+        img_h = pix.height()
+
+        boxes = self.label_cache_boxes.get(img_name, [])
+        polygons = self.label_cache_polygons.get(img_name, [])
+
+        lines = []
+        if boxes:
+            lines.extend(yolo_from_boxes(boxes, img_w, img_h).splitlines())
+        if polygons:
+            lines.extend(yolo_from_polygons(polygons, img_w, img_h).splitlines())
+
+        lbl_path = os.path.join(
+            label_dir,
+            os.path.splitext(img_name)[0] + ".txt"
+        )
+        with open(lbl_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return True
 
     # ----------------------------
     #   prev / next
@@ -815,6 +937,30 @@ class LabelingTool(QMainWindow):
 # ==========================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    # 한글 폰트 설정 (시스템에 맞는 폰트 자동 탐색)
+    import platform
+    system = platform.system()
+    font_candidates = []
+    if system == "Windows":
+        font_candidates = ["Malgun Gothic", "맑은 고딕", "NanumGothic", "Gulim"]
+    elif system == "Darwin":  # macOS
+        font_candidates = ["Apple SD Gothic Neo", "AppleGothic", "NanumGothic"]
+    else:  # Linux
+        font_candidates = ["NanumGothic", "Noto Sans KR", "UnDotum", "Gulim"]
+
+    from PyQt6.QtGui import QFontDatabase
+    available = QFontDatabase.families()
+    chosen_font = None
+    for candidate in font_candidates:
+        if candidate in available:
+            chosen_font = candidate
+            break
+
+    if chosen_font:
+        font = QFont(chosen_font, 9)
+        app.setFont(font)
+
     win = LabelingTool()
     win.show()
     sys.exit(app.exec())
